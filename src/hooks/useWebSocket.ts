@@ -16,6 +16,10 @@ export const useWebSocket = (channelName: string) => {
     reconnectAttempts: 0,
   });
 
+  const MAX_RECONNECT_ATTEMPTS = 10;
+  const BASE_DELAY = 1000;
+  const MAX_DELAY = 30000;
+
   const connect = useCallback(() => {
     if (channel) {
       channel.unsubscribe();
@@ -30,7 +34,12 @@ export const useWebSocket = (channelName: string) => {
 
     newChannel
       .on('presence', { event: 'sync' }, () => {
-        setState(prev => ({ ...prev, isConnected: true, reconnectAttempts: 0 }));
+        setState(prev => ({
+          ...prev,
+          isConnected: true,
+          reconnectAttempts: 0,
+          lastHeartbeat: Date.now()
+        }));
       })
       .on('presence', { event: 'join' }, () => {
         setState(prev => ({ ...prev, lastHeartbeat: Date.now() }));
@@ -44,32 +53,33 @@ export const useWebSocket = (channelName: string) => {
             online_at: new Date().toISOString(),
           });
         } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-          setState(prev => ({
-            ...prev,
-            isConnected: false,
-            reconnectAttempts: prev.reconnectAttempts + 1,
-          }));
-          
-          // Exponential backoff for reconnection
-          const backoffTime = Math.min(1000 * Math.pow(2, state.reconnectAttempts), 30000);
-          setTimeout(connect, backoffTime);
+          setState(prev => {
+            const newAttempts = prev.reconnectAttempts + 1;
+            
+            if (newAttempts >= MAX_RECONNECT_ATTEMPTS) {
+              console.error('Max reconnection attempts reached');
+              return { ...prev, isConnected: false };
+            }
+
+            // Exponential backoff with jitter
+            const delay = Math.min(
+              BASE_DELAY * Math.pow(2, newAttempts) + Math.random() * 1000,
+              MAX_DELAY
+            );
+
+            setTimeout(connect, delay);
+
+            return {
+              ...prev,
+              isConnected: false,
+              reconnectAttempts: newAttempts,
+            };
+          });
         }
       });
 
     setChannel(newChannel);
-  }, [channelName, state.reconnectAttempts]);
-
-  // Heartbeat check
-  useEffect(() => {
-    const heartbeatInterval = setInterval(() => {
-      const now = Date.now();
-      if (now - state.lastHeartbeat > 30000) { // 30 seconds
-        connect(); // Reconnect if no heartbeat
-      }
-    }, 10000);
-
-    return () => clearInterval(heartbeatInterval);
-  }, [state.lastHeartbeat, connect]);
+  }, [channelName]);
 
   // Initial connection
   useEffect(() => {
@@ -80,6 +90,23 @@ export const useWebSocket = (channelName: string) => {
       }
     };
   }, [connect]);
+
+  // Heartbeat check
+  useEffect(() => {
+    const heartbeatInterval = setInterval(() => {
+      const now = Date.now();
+      if (now - state.lastHeartbeat > 30000) { // 30 seconds
+        setState(prev => ({
+          ...prev,
+          isConnected: false,
+          reconnectAttempts: prev.reconnectAttempts + 1
+        }));
+        connect();
+      }
+    }, 10000);
+
+    return () => clearInterval(heartbeatInterval);
+  }, [state.lastHeartbeat, connect]);
 
   return {
     isConnected: state.isConnected,

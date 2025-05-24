@@ -8,12 +8,12 @@ export const useGameSync = (lobbyCode: string) => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lobbyId, setLobbyId] = useState<string | null>(null);
-  const [lastSyncTime, setLastSyncTime] = useState<number>(Date.now());
-  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [version, setVersion] = useState(0);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
 
   const { channel, isConnected } = useWebSocket(`game:${lobbyCode}`);
 
-  // First fetch the lobby ID using the code
+  // Fetch lobby ID
   useEffect(() => {
     const fetchLobbyId = async () => {
       try {
@@ -48,16 +48,19 @@ export const useGameSync = (lobbyCode: string) => {
         table: 'game_state',
         filter: `lobby_id=eq.${lobbyId}`
       }, (payload) => {
-        setGameState(payload.new as GameState);
-        setLastSyncTime(Date.now());
-        setReconnectAttempts(0); // Reset attempts on successful sync
+        const newState = payload.new as GameState;
+        if (newState.version > version) {
+          setGameState(newState);
+          setVersion(newState.version);
+          setError(null);
+        }
       })
       .subscribe();
 
     return () => {
       subscription.unsubscribe();
     };
-  }, [lobbyId]);
+  }, [lobbyId, version]);
 
   // Subscribe to action acknowledgments
   useEffect(() => {
@@ -71,8 +74,16 @@ export const useGameSync = (lobbyCode: string) => {
         table: 'game_action_queue',
         filter: `game_id=eq.${gameState?.id}`
       }, (payload) => {
-        if (payload.new.error) {
-          setError(payload.new.error);
+        if (payload.new.processed) {
+          setPendingActions(prev => {
+            const next = new Set(prev);
+            next.delete(payload.new.id);
+            return next;
+          });
+
+          if (payload.new.error) {
+            setError(payload.new.error);
+          }
         }
       })
       .subscribe();
@@ -82,54 +93,43 @@ export const useGameSync = (lobbyCode: string) => {
     };
   }, [lobbyId, gameState?.id]);
 
-  // Automatic reconnection and state sync
+  // Periodic state validation
   useEffect(() => {
-    if (!lobbyId || !gameState?.id) return;
+    if (!isConnected || !gameState?.id) return;
 
-    const syncInterval = setInterval(async () => {
-      // Check if we haven't received updates recently
-      const timeSinceLastSync = Date.now() - lastSyncTime;
-      
-      if (timeSinceLastSync > 5000 && !isConnected) { // 5 seconds threshold
-        try {
-          // Exponential backoff for reconnection attempts
-          const backoffDelay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-          await new Promise(resolve => setTimeout(resolve, backoffDelay));
+    const validateInterval = setInterval(async () => {
+      try {
+        const { data, error } = await supabase
+          .from('game_state')
+          .select('*')
+          .eq('id', gameState.id)
+          .single();
 
-          // Fetch latest state
-          const { data, error } = await supabase
-            .from('game_state')
-            .select('*')
-            .eq('id', gameState.id)
-            .single();
+        if (error) throw error;
 
-          if (error) throw error;
-
+        if (data.version > version) {
           setGameState(data);
-          setLastSyncTime(Date.now());
-          setReconnectAttempts(prev => prev + 1);
-        } catch (err) {
-          console.error('Error during reconnection:', err);
-          setError('Connection lost. Attempting to reconnect...');
+          setVersion(data.version);
         }
+      } catch (err) {
+        console.error('State validation error:', err);
       }
-    }, 1000); // Check every second
+    }, 5000);
 
-    return () => clearInterval(syncInterval);
-  }, [lobbyId, gameState?.id, lastSyncTime, isConnected, reconnectAttempts]);
+    return () => clearInterval(validateInterval);
+  }, [isConnected, gameState?.id, version]);
 
-  // Queue a game action
   const applyAction = async (action: {
     type: string;
     data: Record<string, any>;
   }) => {
-    if (!lobbyId || !gameState || !isConnected) {
+    if (!gameState?.id || !isConnected) {
       setError('Cannot perform action while disconnected');
       return;
     }
 
     try {
-      const { error } = await supabase.rpc('queue_game_action', {
+      const { data, error } = await supabase.rpc('queue_game_action', {
         p_game_id: gameState.id,
         p_player_name: action.data.playerName,
         p_action_type: action.type,
@@ -137,6 +137,8 @@ export const useGameSync = (lobbyCode: string) => {
       });
 
       if (error) throw error;
+
+      setPendingActions(prev => new Set(prev).add(data));
     } catch (err) {
       console.error('Error applying action:', err);
       setError(err instanceof Error ? err.message : 'Failed to apply action');
@@ -148,6 +150,7 @@ export const useGameSync = (lobbyCode: string) => {
     applyAction,
     isConnected,
     isLoading,
-    error
+    error,
+    hasPendingActions: pendingActions.size > 0
   };
 };
