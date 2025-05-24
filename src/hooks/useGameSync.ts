@@ -64,7 +64,7 @@ export const useGameSync = (lobbyCode: string) => {
 
   // Subscribe to action acknowledgments
   useEffect(() => {
-    if (!lobbyId) return;
+    if (!lobbyId || !gameState?.id) return;
 
     const subscription = supabase
       .channel(`game_actions:${lobbyId}`)
@@ -72,7 +72,7 @@ export const useGameSync = (lobbyCode: string) => {
         event: '*',
         schema: 'public',
         table: 'game_action_queue',
-        filter: `game_id=eq.${gameState?.id}`
+        filter: `game_id=eq.${gameState.id}`
       }, (payload) => {
         if (payload.new.processed) {
           setPendingActions(prev => {
@@ -129,16 +129,27 @@ export const useGameSync = (lobbyCode: string) => {
     }
 
     try {
-      const { data, error } = await supabase.rpc('queue_game_action', {
+      const { data, error } = await supabase.rpc('process_game_action_atomic', {
         p_game_id: gameState.id,
         p_player_name: action.data.playerName,
         p_action_type: action.type,
         p_action_data: action.data
       });
 
-      if (error) throw error;
+      if (error) {
+        if (error.message.includes('Game is busy')) {
+          // Retry with exponential backoff
+          const retryDelay = Math.min(1000 * Math.pow(2, pendingActions.size), 5000);
+          setTimeout(() => applyAction(action), retryDelay);
+          return;
+        }
+        throw error;
+      }
 
-      setPendingActions(prev => new Set(prev).add(data));
+      // Track pending action
+      const actionId = data.action_id;
+      setPendingActions(prev => new Set(prev).add(actionId));
+
     } catch (err) {
       console.error('Error applying action:', err);
       setError(err instanceof Error ? err.message : 'Failed to apply action');
