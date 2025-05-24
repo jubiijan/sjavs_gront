@@ -55,16 +55,39 @@ export const useGameSync = (lobbyCode: string) => {
     };
   }, [lobbyId]);
 
+  // Subscribe to action acknowledgments
+  useEffect(() => {
+    if (!lobbyId) return;
+
+    const subscription = supabase
+      .channel(`game_actions:${lobbyId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'game_action_queue',
+        filter: `game_id=eq.${gameState?.id}`
+      }, (payload) => {
+        if (payload.new.error) {
+          setError(payload.new.error);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [lobbyId, gameState?.id]);
+
   // Queue a game action
   const applyAction = async (action: {
     type: string;
     data: Record<string, any>;
   }) => {
-    if (!lobbyId) return;
+    if (!lobbyId || !gameState) return;
 
     try {
       const { error } = await supabase.rpc('queue_game_action', {
-        p_game_id: gameState?.id,
+        p_game_id: gameState.id,
         p_player_name: action.data.playerName,
         p_action_type: action.type,
         p_action_data: action.data
