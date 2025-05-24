@@ -1,4 +1,3 @@
-```typescript
 import { useState, useEffect, useCallback } from 'react';
 import { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
@@ -146,4 +145,3 @@ export const useWebSocket = (channelName: string, options: WebSocketOptions = {}
     reconnect: connect
   };
 };
-```
