@@ -1,3 +1,4 @@
+```typescript
 import { useState, useEffect, useCallback } from 'react';
 import { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
@@ -138,15 +139,6 @@ export const useWebSocket = (channelName: string, options: WebSocketOptions = {}
     return () => clearInterval(heartbeatInterval);
   }, [state.lastHeartbeat, opts.heartbeatTimeout, opts.heartbeatInterval, handleDisconnect]);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (channel) {
-        channel.unsubscribe();
-      }
-    };
-  }, [channel]);
-
   return {
     isConnected: state.isConnected,
     lastError: state.lastError,
@@ -154,3 +146,4 @@ export const useWebSocket = (channelName: string, options: WebSocketOptions = {}
     reconnect: connect
   };
 };
+```

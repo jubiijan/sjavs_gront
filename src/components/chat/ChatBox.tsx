@@ -1,3 +1,4 @@
+```typescript
 import React, { useState, useRef, useEffect } from 'react';
 import { Send, AlertCircle } from 'lucide-react';
 import { useChat } from '../../hooks/useChat';
@@ -155,3 +156,4 @@ const ChatBox: React.FC<ChatBoxProps> = ({ lobbyId }) => {
 };
 
 export default ChatBox;
+```
