@@ -1,0 +1,99 @@
+.card {
+  width: clamp(40px, 12vw, 100px);
+  height: calc(clamp(40px, 12vw, 100px) * 1.4);
+  perspective: 1000px;
+  transition: transform 0.3s ease, margin 0.3s ease;
+  transform-origin: center bottom;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.card-inner {
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+  border-radius: 10px;
+  background-color: white;
+  border: 1px solid #d1d5db;
+  background-image: url("data:image/svg+xml,%3Csvg width='20' height='20' viewBox='0 0 20 20' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='%23f0f0f0' fill-opacity='0.3' fill-rule='evenodd'%3E%3Ccircle cx='3' cy='3' r='3'/%3E%3Ccircle cx='13' cy='13' r='3'/%3E%3C/g%3E%3C/svg%3E");
+}
+
+.card.hand {
+  transform-origin: center bottom;
+  margin-right: -20px;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), margin 0.2s ease;
+}
+
+.card.hand:last-child {
+  margin-right: 0;
+}
+
+.card.hand.playable {
+  cursor: pointer;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card.hand.playable:hover {
+  transform: translateY(-20px) scale(1.05);
+  z-index: 50 !important;
+}
+
+.card.table {
+  position: absolute;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card-content {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 100%;
+  padding: 6%;
+}
+
+.card-rank {
+  font-size: clamp(0.6rem, 1.5vw, 1rem);
+  font-weight: bold;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1;
+}
+
+.card-suit {
+  font-size: clamp(0.8rem, 2vw, 1.2rem);
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.card-suit.center {
+  font-size: clamp(1.5rem, 4vw, 2.5rem);
+  line-height: 1;
+}
+
+@media (max-width: 640px) {
+  .card {
+    margin-right: -15px;
+  }
+  
+  .card-content {
+    padding: 4%;
+  }
+  
+  .card.hand.playable:hover {
+    transform: translateY(-15px) scale(1.05);
+  }
+}
+
+@media (max-width: 480px) {
+  .card {
+    width: clamp(35px, 10vw, 80px);
+    height: calc(clamp(35px, 10vw, 80px) * 1.4);
+    margin-right: -12px;
+  }
+  
+  .card.hand.playable:hover {
+    transform: translateY(-12px) scale(1.03);
+  }
+}
