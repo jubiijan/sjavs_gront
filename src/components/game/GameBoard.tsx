@@ -9,9 +9,16 @@ interface GameBoardProps {
   players: LobbyPlayer[];
   onPlayCard: (card: string) => void;
   isConnected: boolean;
+  isPlayerTurn: boolean;
 }
 
-const GameBoard: React.FC<GameBoardProps> = ({ gameState, players, onPlayCard, isConnected }) => {
+const GameBoard: React.FC<GameBoardProps> = ({ 
+  gameState, 
+  players, 
+  onPlayCard, 
+  isConnected,
+  isPlayerTurn 
+}) => {
   const { playerName } = useAuth();
   const playerHand = gameState.player_hands[playerName || ''] || [];
   const tableCards = gameState.table_cards || {};
@@ -48,9 +55,6 @@ const GameBoard: React.FC<GameBoardProps> = ({ gameState, players, onPlayCard, i
         return undefined;
     }
   };
-  
-  // Check if it's the current player's turn
-  const isPlayerTurn = gameState.current_player === currentPosition;
   
   // Check if card is playable
   const isCardPlayable = (card: string) => {

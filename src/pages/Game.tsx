@@ -48,6 +48,7 @@ const Game: React.FC = () => {
               players={players}
               onPlayCard={playCard}
               isConnected={isConnected}
+              isPlayerTurn={isPlayerTurn()}
             />
             
             <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-6">
