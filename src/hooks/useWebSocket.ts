@@ -6,20 +6,57 @@ interface WebSocketState {
   isConnected: boolean;
   lastHeartbeat: number;
   reconnectAttempts: number;
+  lastError: string | null;
 }
 
-export const useWebSocket = (channelName: string) => {
+interface WebSocketOptions {
+  maxReconnectAttempts?: number;
+  baseDelay?: number;
+  maxDelay?: number;
+  heartbeatInterval?: number;
+  heartbeatTimeout?: number;
+}
+
+const DEFAULT_OPTIONS: WebSocketOptions = {
+  maxReconnectAttempts: 10,
+  baseDelay: 1000,
+  maxDelay: 30000,
+  heartbeatInterval: 10000,
+  heartbeatTimeout: 30000
+};
+
+export const useWebSocket = (channelName: string, options: WebSocketOptions = {}) => {
   const [channel, setChannel] = useState<RealtimeChannel | null>(null);
   const [state, setState] = useState<WebSocketState>({
     isConnected: false,
     lastHeartbeat: Date.now(),
     reconnectAttempts: 0,
+    lastError: null
   });
 
-  const MAX_RECONNECT_ATTEMPTS = 10;
-  const BASE_DELAY = 1000;
-  const MAX_DELAY = 30000;
+  const opts = { ...DEFAULT_OPTIONS, ...options };
 
+  // Track connection state
+  const updateConnectionState = useCallback((connected: boolean, error?: string) => {
+    setState(prev => ({
+      ...prev,
+      isConnected: connected,
+      lastHeartbeat: connected ? Date.now() : prev.lastHeartbeat,
+      reconnectAttempts: connected ? 0 : prev.reconnectAttempts,
+      lastError: error || null
+    }));
+  }, []);
+
+  // Calculate backoff delay
+  const getBackoffDelay = useCallback(() => {
+    const jitter = Math.random() * 1000;
+    return Math.min(
+      opts.baseDelay! * Math.pow(2, state.reconnectAttempts) + jitter,
+      opts.maxDelay!
+    );
+  }, [state.reconnectAttempts, opts.baseDelay, opts.maxDelay]);
+
+  // Connect to channel
   const connect = useCallback(() => {
     if (channel) {
       channel.unsubscribe();
@@ -34,12 +71,7 @@ export const useWebSocket = (channelName: string) => {
 
     newChannel
       .on('presence', { event: 'sync' }, () => {
-        setState(prev => ({
-          ...prev,
-          isConnected: true,
-          reconnectAttempts: 0,
-          lastHeartbeat: Date.now()
-        }));
+        updateConnectionState(true);
       })
       .on('presence', { event: 'join' }, () => {
         setState(prev => ({ ...prev, lastHeartbeat: Date.now() }));
@@ -53,33 +85,36 @@ export const useWebSocket = (channelName: string) => {
             online_at: new Date().toISOString(),
           });
         } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-          setState(prev => {
-            const newAttempts = prev.reconnectAttempts + 1;
-            
-            if (newAttempts >= MAX_RECONNECT_ATTEMPTS) {
-              console.error('Max reconnection attempts reached');
-              return { ...prev, isConnected: false };
-            }
-
-            // Exponential backoff with jitter
-            const delay = Math.min(
-              BASE_DELAY * Math.pow(2, newAttempts) + Math.random() * 1000,
-              MAX_DELAY
-            );
-
-            setTimeout(connect, delay);
-
-            return {
-              ...prev,
-              isConnected: false,
-              reconnectAttempts: newAttempts,
-            };
-          });
+          handleDisconnect('Connection lost');
         }
       });
 
     setChannel(newChannel);
-  }, [channelName]);
+  }, [channelName, updateConnectionState]);
+
+  // Handle disconnection
+  const handleDisconnect = useCallback((error?: string) => {
+    setState(prev => {
+      const newAttempts = prev.reconnectAttempts + 1;
+      
+      if (newAttempts >= opts.maxReconnectAttempts!) {
+        return {
+          ...prev,
+          isConnected: false,
+          lastError: 'Max reconnection attempts reached'
+        };
+      }
+
+      setTimeout(connect, getBackoffDelay());
+
+      return {
+        ...prev,
+        isConnected: false,
+        reconnectAttempts: newAttempts,
+        lastError: error || prev.lastError
+      };
+    });
+  }, [connect, getBackoffDelay, opts.maxReconnectAttempts]);
 
   // Initial connection
   useEffect(() => {
@@ -91,25 +126,31 @@ export const useWebSocket = (channelName: string) => {
     };
   }, [connect]);
 
-  // Heartbeat check
+  // Heartbeat monitoring
   useEffect(() => {
     const heartbeatInterval = setInterval(() => {
       const now = Date.now();
-      if (now - state.lastHeartbeat > 30000) { // 30 seconds
-        setState(prev => ({
-          ...prev,
-          isConnected: false,
-          reconnectAttempts: prev.reconnectAttempts + 1
-        }));
-        connect();
+      if (now - state.lastHeartbeat > opts.heartbeatTimeout!) {
+        handleDisconnect('Heartbeat timeout');
       }
-    }, 10000);
+    }, opts.heartbeatInterval);
 
     return () => clearInterval(heartbeatInterval);
-  }, [state.lastHeartbeat, connect]);
+  }, [state.lastHeartbeat, opts.heartbeatTimeout, opts.heartbeatInterval, handleDisconnect]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (channel) {
+        channel.unsubscribe();
+      }
+    };
+  }, [channel]);
 
   return {
     isConnected: state.isConnected,
+    lastError: state.lastError,
     channel,
+    reconnect: connect
   };
 };
