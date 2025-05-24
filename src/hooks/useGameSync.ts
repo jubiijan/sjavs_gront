@@ -15,12 +15,14 @@ interface SyncOptions {
   retryLimit?: number;
   retryDelay?: number;
   syncInterval?: number;
+  turnTimeout?: number;
 }
 
 const DEFAULT_OPTIONS: SyncOptions = {
   retryLimit: 5,
   retryDelay: 1000,
-  syncInterval: 5000
+  syncInterval: 5000,
+  turnTimeout: 30000 // 30 seconds turn timeout
 };
 
 export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
@@ -37,8 +39,47 @@ export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
   const [isRecovering, setIsRecovering] = useState(false);
   const [channel, setChannel] = useState<RealtimeChannel | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [playerPresence, setPlayerPresence] = useState<Record<string, any>>({});
 
   const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  // Track player presence
+  const updatePlayerPresence = useCallback((state: Record<string, any>) => {
+    setPlayerPresence(state);
+    
+    // Check if current player is disconnected
+    if (sync.state?.current_player !== undefined) {
+      const currentPlayerName = Object.values(state)
+        .flat()
+        .find((p: any) => p.position === sync.state?.current_player)?.player_name;
+
+      if (currentPlayerName) {
+        const presence = Object.values(state)
+          .flat()
+          .find((p: any) => p.player_name === currentPlayerName);
+
+        // If current player is disconnected for more than turn timeout
+        if (presence && Date.now() - new Date(presence.last_seen).getTime() > opts.turnTimeout!) {
+          handlePlayerTimeout(currentPlayerName);
+        }
+      }
+    }
+  }, [sync.state?.current_player, opts.turnTimeout]);
+
+  // Handle disconnected player's turn
+  const handlePlayerTimeout = async (playerName: string) => {
+    if (!sync.state?.id) return;
+
+    try {
+      // Skip disconnected player's turn
+      await supabase.rpc('skip_player_turn', {
+        p_game_id: sync.state.id,
+        p_player_name: playerName
+      });
+    } catch (err) {
+      console.error('Error handling player timeout:', err);
+    }
+  };
 
   // Fetch initial game state
   const fetchGameState = useCallback(async () => {
@@ -88,6 +129,8 @@ export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
 
     newChannel
       .on('presence', { event: 'sync' }, () => {
+        const state = newChannel.presenceState();
+        updatePlayerPresence(state);
         setIsConnected(true);
         setSync(prev => ({
           ...prev,
@@ -95,8 +138,12 @@ export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
           lastSyncedAt: Date.now()
         }));
       })
-      .on('presence', { event: 'join' }, () => {
+      .on('presence', { event: 'join' }, ({ key, newPresences }) => {
         setSync(prev => ({ ...prev, lastSyncedAt: Date.now() }));
+      })
+      .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+        const state = newChannel.presenceState();
+        updatePlayerPresence(state);
       })
       .on('postgres_changes', {
         event: '*',
@@ -133,7 +180,7 @@ export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
     return () => {
       newChannel.unsubscribe();
     };
-  }, [lobbyId]);
+  }, [lobbyId, updatePlayerPresence]);
 
   // Handle connection recovery
   const recoverConnection = async () => {
@@ -304,6 +351,7 @@ export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
     error,
     isRecovering,
     hasPendingActions: sync.pendingActions.size > 0,
-    lastSyncedAt: sync.lastSyncedAt
+    lastSyncedAt: sync.lastSyncedAt,
+    playerPresence
   };
 };
