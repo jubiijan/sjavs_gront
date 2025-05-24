@@ -55,9 +55,35 @@ const GameBoard: React.FC<GameBoardProps> = ({
         return undefined;
     }
   };
+
+  // Check if a card is a permanent trump
+  const isPermanentTrump = (card: string) => {
+    const isThreePlayer = players.length === 3;
+    const permanentTrumps = [
+      'QC', // Queen of Clubs (highest)
+      'QS', // Queen of Spades
+      'JC', // Jack of Clubs
+      'JS', // Jack of Spades
+      'JH', // Jack of Hearts
+      ...(isThreePlayer ? [] : ['JD']) // Jack of Diamonds (4-player only)
+    ];
+    return permanentTrumps.includes(card);
+  };
+
+  // Check if player has any cards of a given suit
+  const hasCardsOfSuit = (suit: string) => {
+    return playerHand.some(card => {
+      // Don't count permanent trumps when checking suit
+      if (isPermanentTrump(card)) {
+        return false;
+      }
+      return card.slice(-1) === suit;
+    });
+  };
   
   // Check if card is playable
   const isCardPlayable = (card: string) => {
+    // Basic state checks
     if (!isPlayerTurn || gameState.current_phase !== 'playing' || !isConnected) {
       return false;
     }
@@ -74,8 +100,13 @@ const GameBoard: React.FC<GameBoardProps> = ({
     const firstCardSuit = firstCard.slice(-1);
     const cardSuit = card.slice(-1);
 
-    // Check if player has any cards of the led suit
-    const hasSameSuit = playerHand.some(c => c.slice(-1) === firstCardSuit);
+    // Permanent trumps can always be played
+    if (isPermanentTrump(card)) {
+      return true;
+    }
+
+    // Check if player has any cards of the led suit (excluding permanent trumps)
+    const hasSameSuit = hasCardsOfSuit(firstCardSuit);
 
     // If player has cards of the led suit, they must play one
     if (hasSameSuit) {
