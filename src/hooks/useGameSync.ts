@@ -8,6 +8,7 @@ interface GameSync {
   version: number;
   pendingActions: Map<string, any>;
   lastSyncedAt: number;
+  recoveryAttempts: number;
 }
 
 export const useGameSync = (lobbyCode: string) => {
@@ -16,10 +17,12 @@ export const useGameSync = (lobbyCode: string) => {
     version: 0,
     pendingActions: new Map(),
     lastSyncedAt: Date.now(),
+    recoveryAttempts: 0
   });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lobbyId, setLobbyId] = useState<string | null>(null);
+  const [isRecovering, setIsRecovering] = useState(false);
 
   const { channel, isConnected } = useWebSocket(`game:${lobbyCode}`);
 
@@ -69,7 +72,8 @@ export const useGameSync = (lobbyCode: string) => {
               ...prev,
               state: newState,
               version: newState.version,
-              lastSyncedAt: Date.now()
+              lastSyncedAt: Date.now(),
+              recoveryAttempts: 0 // Reset recovery attempts on successful sync
             };
           }
           return prev;
@@ -82,51 +86,75 @@ export const useGameSync = (lobbyCode: string) => {
     };
   }, [lobbyId]);
 
-  // Subscribe to action acknowledgments
+  // Handle state recovery
+  const recoverGameState = async () => {
+    if (!sync.state?.id || isRecovering) return;
+    
+    setIsRecovering(true);
+    
+    try {
+      // Get latest game state
+      const { data: gameState, error: gameError } = await supabase
+        .from('game_state')
+        .select('*')
+        .eq('id', sync.state.id)
+        .single();
+
+      if (gameError) throw gameError;
+
+      // Get pending actions
+      const { data: actions, error: actionsError } = await supabase
+        .from('game_action_queue')
+        .select('*')
+        .eq('game_id', sync.state.id)
+        .eq('processed', false)
+        .order('version', { ascending: true });
+
+      if (actionsError) throw actionsError;
+
+      // Replay pending actions
+      const pendingActions = new Map();
+      for (const action of actions || []) {
+        pendingActions.set(action.id, {
+          type: action.action_type,
+          data: action.action_data
+        });
+      }
+
+      setSync(prev => ({
+        ...prev,
+        state: gameState,
+        version: gameState.version,
+        pendingActions,
+        lastSyncedAt: Date.now(),
+        recoveryAttempts: prev.recoveryAttempts + 1
+      }));
+
+      setError(null);
+    } catch (err) {
+      console.error('Recovery error:', err);
+      setError('Failed to recover game state');
+    } finally {
+      setIsRecovering(false);
+    }
+  };
+
+  // Handle disconnection recovery
   useEffect(() => {
-    if (!lobbyId || !sync.state?.id) return;
-
-    const subscription = supabase
-      .channel(`game_actions:${lobbyId}`)
-      .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'game_action_queue',
-        filter: `game_id=eq.${sync.state.id}`
-      }, (payload) => {
-        if (payload.new.processed) {
-          setSync(prev => {
-            const pendingActions = new Map(prev.pendingActions);
-            pendingActions.delete(payload.new.id);
-
-            if (payload.new.error) {
-              setError(payload.new.error);
-              // Rollback state if needed
-              if (payload.new.rollback_data) {
-                return {
-                  ...prev,
-                  state: payload.new.rollback_data as GameState,
-                  version: (payload.new.rollback_data as GameState).version,
-                  pendingActions,
-                  lastSyncedAt: Date.now()
-                };
-              }
-            }
-
-            return {
-              ...prev,
-              pendingActions,
-              lastSyncedAt: Date.now()
-            };
-          });
+    if (!isConnected && sync.state?.id) {
+      const recoveryDelay = Math.min(1000 * Math.pow(2, sync.recoveryAttempts), 30000);
+      
+      const recoveryTimeout = setTimeout(() => {
+        if (sync.recoveryAttempts < 5) {
+          recoverGameState();
+        } else {
+          setError('Unable to recover game state after multiple attempts');
         }
-      })
-      .subscribe();
+      }, recoveryDelay);
 
-    return () => {
-      subscription.unsubscribe();
-    };
-  }, [lobbyId, sync.state?.id]);
+      return () => clearTimeout(recoveryTimeout);
+    }
+  }, [isConnected, sync.state?.id, sync.recoveryAttempts]);
 
   // Periodic state validation
   useEffect(() => {
@@ -148,29 +176,18 @@ export const useGameSync = (lobbyCode: string) => {
             ...prev,
             state: data,
             version: data.version,
-            lastSyncedAt: Date.now()
+            lastSyncedAt: Date.now(),
+            recoveryAttempts: 0
           }));
         }
       } catch (err) {
         console.error('State validation error:', err);
+        setError('Failed to validate game state');
       }
     }, 5000);
 
     return () => clearInterval(validateInterval);
   }, [isConnected, sync.state?.id, sync.version]);
-
-  // Handle reconnection
-  useEffect(() => {
-    if (!isConnected && sync.state?.id) {
-      // Mark all pending actions as failed
-      setSync(prev => ({
-        ...prev,
-        pendingActions: new Map(),
-        lastSyncedAt: Date.now()
-      }));
-      setError('Connection lost. Reconnecting...');
-    }
-  }, [isConnected, sync.state?.id]);
 
   const applyAction = async (action: {
     type: string;
@@ -214,6 +231,11 @@ export const useGameSync = (lobbyCode: string) => {
     } catch (err) {
       console.error('Error applying action:', err);
       setError(err instanceof Error ? err.message : 'Failed to apply action');
+      
+      // Attempt recovery if action fails
+      if (sync.recoveryAttempts < 5) {
+        recoverGameState();
+      }
     }
   };
 
@@ -223,6 +245,7 @@ export const useGameSync = (lobbyCode: string) => {
     isConnected,
     isLoading,
     error,
+    isRecovering,
     hasPendingActions: sync.pendingActions.size > 0,
     lastSyncedAt: sync.lastSyncedAt
   };
