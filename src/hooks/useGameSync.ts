@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useWebSocket } from './useWebSocket';
+import { useState, useEffect, useCallback } from 'react';
+import { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 import { GameState } from '../types/gameTypes';
 
@@ -11,7 +11,19 @@ interface GameSync {
   recoveryAttempts: number;
 }
 
-export const useGameSync = (lobbyCode: string) => {
+interface SyncOptions {
+  retryLimit?: number;
+  retryDelay?: number;
+  syncInterval?: number;
+}
+
+const DEFAULT_OPTIONS: SyncOptions = {
+  retryLimit: 5,
+  retryDelay: 1000,
+  syncInterval: 5000
+};
+
+export const useGameSync = (lobbyCode: string, options: SyncOptions = {}) => {
   const [sync, setSync] = useState<GameSync>({
     state: null,
     version: 0,
@@ -23,12 +35,202 @@ export const useGameSync = (lobbyCode: string) => {
   const [error, setError] = useState<string | null>(null);
   const [lobbyId, setLobbyId] = useState<string | null>(null);
   const [isRecovering, setIsRecovering] = useState(false);
+  const [channel, setChannel] = useState<RealtimeChannel | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  const { channel, isConnected } = useWebSocket(`game:${lobbyCode}`);
+  const opts = { ...DEFAULT_OPTIONS, ...options };
 
-  // Fetch lobby ID
+  // Fetch initial game state
+  const fetchGameState = useCallback(async () => {
+    if (!lobbyId) return;
+
+    try {
+      const { data: gameState, error: gameError } = await supabase
+        .from('game_state')
+        .select('*')
+        .eq('lobby_id', lobbyId)
+        .single();
+
+      if (gameError) throw gameError;
+
+      setSync(prev => ({
+        ...prev,
+        state: gameState,
+        version: gameState.version || 0,
+        lastSyncedAt: Date.now(),
+        recoveryAttempts: 0
+      }));
+
+      setError(null);
+    } catch (err) {
+      console.error('Error fetching game state:', err);
+      setError('Failed to fetch game state');
+      
+      if (sync.recoveryAttempts < (opts.retryLimit || 5)) {
+        setTimeout(fetchGameState, Math.min(
+          opts.retryDelay! * Math.pow(2, sync.recoveryAttempts),
+          30000
+        ));
+      }
+    }
+  }, [lobbyId, opts.retryDelay, opts.retryLimit]);
+
+  // Set up real-time subscription
+  const setupRealtimeSubscription = useCallback(() => {
+    if (!lobbyId) return;
+
+    const newChannel = supabase.channel(`game_state:${lobbyId}`, {
+      config: {
+        broadcast: { self: true },
+        presence: { key: lobbyId },
+      },
+    });
+
+    newChannel
+      .on('presence', { event: 'sync' }, () => {
+        setIsConnected(true);
+        setSync(prev => ({
+          ...prev,
+          recoveryAttempts: 0,
+          lastSyncedAt: Date.now()
+        }));
+      })
+      .on('presence', { event: 'join' }, () => {
+        setSync(prev => ({ ...prev, lastSyncedAt: Date.now() }));
+      })
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'game_state',
+        filter: `lobby_id=eq.${lobbyId}`
+      }, async (payload) => {
+        const newState = payload.new as GameState;
+        
+        // Only update if version is newer
+        if (newState.version > sync.version) {
+          setSync(prev => ({
+            ...prev,
+            state: newState,
+            version: newState.version,
+            lastSyncedAt: Date.now(),
+            recoveryAttempts: 0
+          }));
+        }
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          await newChannel.track({
+            online_at: new Date().toISOString(),
+          });
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+          setIsConnected(false);
+          await recoverConnection();
+        }
+      });
+
+    setChannel(newChannel);
+
+    return () => {
+      newChannel.unsubscribe();
+    };
+  }, [lobbyId]);
+
+  // Handle connection recovery
+  const recoverConnection = async () => {
+    setSync(prev => ({
+      ...prev,
+      recoveryAttempts: prev.recoveryAttempts + 1
+    }));
+
+    if (sync.recoveryAttempts < (opts.retryLimit || 5)) {
+      const delay = Math.min(
+        opts.retryDelay! * Math.pow(2, sync.recoveryAttempts),
+        30000
+      );
+
+      setTimeout(() => {
+        setupRealtimeSubscription();
+        fetchGameState();
+      }, delay);
+    } else {
+      setError('Connection lost. Please refresh the page.');
+    }
+  };
+
+  // Apply game action
+  const applyAction = async (action: {
+    type: string;
+    data: Record<string, any>;
+  }) => {
+    if (!sync.state?.id || !isConnected) {
+      setError('Cannot perform action while disconnected');
+      return;
+    }
+
+    try {
+      // Get an advisory lock for this game
+      const { data: lockData, error: lockError } = await supabase.rpc(
+        'acquire_game_lock',
+        { p_game_id: sync.state.id }
+      );
+
+      if (lockError || !lockData) {
+        throw new Error('Game is busy, please try again');
+      }
+
+      // Process the action atomically
+      const { data, error } = await supabase.rpc('process_game_action_atomic', {
+        p_game_id: sync.state.id,
+        p_player_name: action.data.playerName,
+        p_action_type: action.type,
+        p_action_data: action.data,
+        p_expected_version: sync.version
+      });
+
+      if (error) {
+        if (error.message.includes('Version mismatch')) {
+          await fetchGameState();
+          throw new Error('Game state has changed, please try again');
+        }
+        throw error;
+      }
+
+      // Track pending action
+      const actionId = data.action_id;
+      setSync(prev => {
+        const pendingActions = new Map(prev.pendingActions);
+        pendingActions.set(actionId, action);
+        return {
+          ...prev,
+          pendingActions,
+          lastSyncedAt: Date.now()
+        };
+      });
+
+    } catch (err) {
+      console.error('Error applying action:', err);
+      
+      const errorMessage = err instanceof Error ? err.message : 'Failed to apply action';
+      setError(errorMessage);
+
+      // Retry with exponential backoff if appropriate
+      if (errorMessage.includes('Game is busy')) {
+        const retryDelay = Math.min(
+          opts.retryDelay! * Math.pow(2, sync.pendingActions.size),
+          5000
+        );
+        setTimeout(() => applyAction(action), retryDelay);
+      } else if (sync.recoveryAttempts < (opts.retryLimit || 5)) {
+        await fetchGameState();
+      }
+    }
+  };
+
+  // Initialize
   useEffect(() => {
-    const fetchLobbyId = async () => {
+    if (!lobbyCode) return;
+
+    const initialize = async () => {
       try {
         const { data, error } = await supabase
           .from('lobbies')
@@ -46,115 +248,20 @@ export const useGameSync = (lobbyCode: string) => {
       }
     };
 
-    if (lobbyCode) {
-      fetchLobbyId();
-    }
+    initialize();
   }, [lobbyCode]);
 
-  // Subscribe to game state changes
+  // Set up subscriptions when lobby ID is available
   useEffect(() => {
     if (!lobbyId) return;
-
-    const subscription = supabase
-      .channel(`game_state:${lobbyId}`)
-      .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'game_state',
-        filter: `lobby_id=eq.${lobbyId}`
-      }, (payload) => {
-        const newState = payload.new as GameState;
-        
-        setSync(prev => {
-          // Only update if version is newer
-          if (newState.version > prev.version) {
-            return {
-              ...prev,
-              state: newState,
-              version: newState.version,
-              lastSyncedAt: Date.now(),
-              recoveryAttempts: 0 // Reset recovery attempts on successful sync
-            };
-          }
-          return prev;
-        });
-      })
-      .subscribe();
+    
+    const cleanup = setupRealtimeSubscription();
+    fetchGameState();
 
     return () => {
-      subscription.unsubscribe();
+      if (cleanup) cleanup();
     };
-  }, [lobbyId]);
-
-  // Handle state recovery
-  const recoverGameState = async () => {
-    if (!sync.state?.id || isRecovering) return;
-    
-    setIsRecovering(true);
-    
-    try {
-      // Get latest game state
-      const { data: gameState, error: gameError } = await supabase
-        .from('game_state')
-        .select('*')
-        .eq('id', sync.state.id)
-        .single();
-
-      if (gameError) throw gameError;
-
-      // Get pending actions
-      const { data: actions, error: actionsError } = await supabase
-        .from('game_action_queue')
-        .select('*')
-        .eq('game_id', sync.state.id)
-        .eq('processed', false)
-        .order('version', { ascending: true });
-
-      if (actionsError) throw actionsError;
-
-      // Replay pending actions
-      const pendingActions = new Map();
-      for (const action of actions || []) {
-        pendingActions.set(action.id, {
-          type: action.action_type,
-          data: action.action_data
-        });
-      }
-
-      setSync(prev => ({
-        ...prev,
-        state: gameState,
-        version: gameState.version,
-        pendingActions,
-        lastSyncedAt: Date.now(),
-        recoveryAttempts: prev.recoveryAttempts + 1
-      }));
-
-      setError(null);
-    } catch (err) {
-      console.error('Recovery error:', err);
-      setError('Failed to recover game state');
-    } finally {
-      setIsRecovering(false);
-    }
-  };
-
-  // Handle disconnection recovery
-  useEffect(() => {
-    if (!isConnected && sync.state?.id) {
-      const recoveryDelay = Math.min(1000 * Math.pow(2, sync.recoveryAttempts), 30000);
-      
-      const recoveryTimeout = setTimeout(() => {
-        if (sync.recoveryAttempts < 5) {
-          recoverGameState();
-        } else {
-          setError('Unable to recover game state after multiple attempts');
-        }
-      }, recoveryDelay);
-
-      return () => clearTimeout(recoveryTimeout);
-    }
-  }, [isConnected, sync.state?.id, sync.recoveryAttempts]);
+  }, [lobbyId, setupRealtimeSubscription, fetchGameState]);
 
   // Periodic state validation
   useEffect(() => {
@@ -184,60 +291,10 @@ export const useGameSync = (lobbyCode: string) => {
         console.error('State validation error:', err);
         setError('Failed to validate game state');
       }
-    }, 5000);
+    }, opts.syncInterval);
 
     return () => clearInterval(validateInterval);
-  }, [isConnected, sync.state?.id, sync.version]);
-
-  const applyAction = async (action: {
-    type: string;
-    data: Record<string, any>;
-  }) => {
-    if (!sync.state?.id || !isConnected) {
-      setError('Cannot perform action while disconnected');
-      return;
-    }
-
-    try {
-      const { data, error } = await supabase.rpc('process_game_action_atomic', {
-        p_game_id: sync.state.id,
-        p_player_name: action.data.playerName,
-        p_action_type: action.type,
-        p_action_data: action.data
-      });
-
-      if (error) {
-        if (error.message.includes('Game is busy')) {
-          // Retry with exponential backoff
-          const retryDelay = Math.min(1000 * Math.pow(2, sync.pendingActions.size), 5000);
-          setTimeout(() => applyAction(action), retryDelay);
-          return;
-        }
-        throw error;
-      }
-
-      // Track pending action
-      const actionId = data.action_id;
-      setSync(prev => {
-        const pendingActions = new Map(prev.pendingActions);
-        pendingActions.set(actionId, action);
-        return {
-          ...prev,
-          pendingActions,
-          lastSyncedAt: Date.now()
-        };
-      });
-
-    } catch (err) {
-      console.error('Error applying action:', err);
-      setError(err instanceof Error ? err.message : 'Failed to apply action');
-      
-      // Attempt recovery if action fails
-      if (sync.recoveryAttempts < 5) {
-        recoverGameState();
-      }
-    }
-  };
+  }, [isConnected, sync.state?.id, sync.version, opts.syncInterval]);
 
   return {
     gameState: sync.state,
