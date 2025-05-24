@@ -6,7 +6,6 @@ import { useNavigate } from 'react-router-dom';
 import { useGameSync } from './useGameSync';
 
 export const useGame = (code: string) => {
-  const [gameState, setGameState] = useState<GameState | null>(null);
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -14,13 +13,7 @@ export const useGame = (code: string) => {
   const navigate = useNavigate();
   
   // Use the game sync hook
-  const { gameState: syncedState, applyAction, isConnected } = useGameSync(code);
-
-  useEffect(() => {
-    if (syncedState) {
-      setGameState(syncedState);
-    }
-  }, [syncedState]);
+  const { gameState, applyAction, isConnected, isLoading: syncLoading } = useGameSync(code);
 
   useEffect(() => {
     let mounted = true;
@@ -92,67 +85,47 @@ export const useGame = (code: string) => {
   };
 
   const playCard = async (card: string) => {
-    if (!gameState || !playerName || !isPlayerTurn() || gameState.current_phase !== 'playing') {
-      return;
-    }
+    if (!gameState || !playerName) return;
 
     try {
-      const hand = gameState.player_hands[playerName] || [];
-      if (!hand.includes(card)) return;
-
-      const updatedState = {
-        ...gameState,
-        player_hands: {
-          ...gameState.player_hands,
-          [playerName]: hand.filter(c => c !== card)
-        },
-        table_cards: {
-          ...gameState.table_cards,
-          [playerName]: card
+      await applyAction({
+        type: 'play_card',
+        data: {
+          playerName,
+          card
         }
-      };
-
-      await applyAction(updatedState);
-
+      });
     } catch (error) {
       console.error('Error playing card:', error);
     }
   };
 
   const selectTrump = async (suit: string) => {
-    if (!gameState || !playerName || !isPlayerTurn() || gameState.current_phase !== 'bidding') {
-      return;
-    }
+    if (!gameState || !playerName) return;
 
     try {
-      const updatedState = {
-        ...gameState,
-        trump_suit: suit,
-        trump_declarer: playerName,
-        current_phase: 'playing'
-      };
-
-      await applyAction(updatedState);
-
+      await applyAction({
+        type: 'declare_trump',
+        data: {
+          playerName,
+          suit
+        }
+      });
     } catch (error) {
       console.error('Error selecting trump:', error);
     }
   };
 
   const passBid = async () => {
-    if (!gameState || !playerName || !isPlayerTurn() || gameState.current_phase !== 'bidding') {
-      return;
-    }
+    if (!gameState || !playerName) return;
 
     try {
-      const nextPosition = (gameState.current_player + 1) % players.length;
-      const updatedState = {
-        ...gameState,
-        current_player: nextPosition
-      };
-
-      await applyAction(updatedState);
-
+      await applyAction({
+        type: 'pass',
+        data: {
+          playerName
+        }
+      });
     } catch (error) {
       console.error('Error passing bid:', error);
     }
@@ -167,7 +140,7 @@ export const useGame = (code: string) => {
   return {
     gameState,
     players,
-    isLoading,
+    isLoading: isLoading || syncLoading,
     error,
     isPlayerTurn,
     selectTrump,

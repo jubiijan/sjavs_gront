@@ -3,18 +3,10 @@ import { useWebSocket } from './useWebSocket';
 import { supabase } from '../lib/supabase';
 import { GameState } from '../types/gameTypes';
 
-interface GameSync {
-  localState: GameState | null;
-  pendingActions: Map<string, any>;
-  lastSyncedAt: number;
-}
-
 export const useGameSync = (lobbyCode: string) => {
-  const [sync, setSync] = useState<GameSync>({
-    localState: null,
-    pendingActions: new Map(),
-    lastSyncedAt: Date.now(),
-  });
+  const [gameState, setGameState] = useState<GameState | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [lobbyId, setLobbyId] = useState<string | null>(null);
 
   const { channel, isConnected } = useWebSocket(`game:${lobbyCode}`);
@@ -33,6 +25,7 @@ export const useGameSync = (lobbyCode: string) => {
         setLobbyId(data.id);
       } catch (err) {
         console.error('Error fetching lobby ID:', err);
+        setError(err instanceof Error ? err.message : 'Failed to fetch lobby');
       }
     };
 
@@ -41,71 +34,54 @@ export const useGameSync = (lobbyCode: string) => {
     }
   }, [lobbyCode]);
 
-  // Handle optimistic updates
-  const applyAction = async (action: any) => {
-    if (!lobbyId) return;
-    
-    const actionId = crypto.randomUUID();
-    
-    // Apply optimistically to local state
-    setSync(prev => ({
-      ...prev,
-      pendingActions: prev.pendingActions.set(actionId, action),
-      localState: applyActionToState(prev.localState, action),
-    }));
-
-    try {
-      // Send to server
-      const { error } = await supabase
-        .from('game_state')
-        .update(action)
-        .eq('lobby_id', lobbyId);
-
-      if (error) throw error;
-
-      // Broadcast to other players
-      channel?.send({
-        type: 'broadcast',
-        event: 'game_action',
-        payload: { actionId, ...action }
-      });
-    } catch (error) {
-      // Revert on failure
-      setSync(prev => {
-        const pendingActions = prev.pendingActions;
-        pendingActions.delete(actionId);
-        return {
-          ...prev,
-          pendingActions,
-          localState: recomputeState(prev.localState, Array.from(pendingActions.values())),
-        };
-      });
-    }
-  };
-
-  // Listen for remote actions
+  // Subscribe to game state changes
   useEffect(() => {
-    if (!channel) return;
+    if (!lobbyId) return;
 
-    const subscription = channel
-      .on('broadcast', { event: 'game_action' }, ({ payload }) => {
-        setSync(prev => ({
-          ...prev,
-          localState: applyActionToState(prev.localState, payload),
-          lastSyncedAt: Date.now(),
-        }));
-      });
+    const subscription = supabase
+      .channel(`game_state:${lobbyId}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'game_state',
+        filter: `lobby_id=eq.${lobbyId}`
+      }, (payload) => {
+        setGameState(payload.new as GameState);
+      })
+      .subscribe();
 
     return () => {
       subscription.unsubscribe();
     };
-  }, [channel]);
+  }, [lobbyId]);
 
-  // Periodic state validation
+  // Queue a game action
+  const applyAction = async (action: {
+    type: string;
+    data: Record<string, any>;
+  }) => {
+    if (!lobbyId) return;
+
+    try {
+      const { error } = await supabase.rpc('queue_game_action', {
+        p_game_id: gameState?.id,
+        p_player_name: action.data.playerName,
+        p_action_type: action.type,
+        p_action_data: action.data
+      });
+
+      if (error) throw error;
+    } catch (err) {
+      console.error('Error applying action:', err);
+      setError(err instanceof Error ? err.message : 'Failed to apply action');
+    }
+  };
+
+  // Initial game state fetch
   useEffect(() => {
-    if (!isConnected || !lobbyId) return;
+    const fetchGameState = async () => {
+      if (!lobbyId) return;
 
-    const validateInterval = setInterval(async () => {
       try {
         const { data, error } = await supabase
           .from('game_state')
@@ -114,43 +90,23 @@ export const useGameSync = (lobbyCode: string) => {
           .single();
 
         if (error) throw error;
-
-        // Check if server state matches local state
-        if (!statesMatch(data, sync.localState)) {
-          setSync(prev => ({
-            ...prev,
-            localState: data,
-            pendingActions: new Map(),
-            lastSyncedAt: Date.now(),
-          }));
-        }
-      } catch (error) {
-        console.error('State validation error:', error);
+        setGameState(data);
+      } catch (err) {
+        console.error('Error fetching game state:', err);
+        setError(err instanceof Error ? err.message : 'Failed to fetch game state');
+      } finally {
+        setIsLoading(false);
       }
-    }, 5000);
+    };
 
-    return () => clearInterval(validateInterval);
-  }, [isConnected, lobbyId, sync.localState]);
+    fetchGameState();
+  }, [lobbyId]);
 
   return {
-    gameState: sync.localState,
+    gameState,
     applyAction,
     isConnected,
+    isLoading,
+    error
   };
-};
-
-// Helper functions
-const applyActionToState = (state: GameState | null, action: any): GameState => {
-  if (!state) return action;
-  return { ...state, ...action };
-};
-
-const recomputeState = (baseState: GameState | null, actions: any[]): GameState => {
-  if (!baseState) return actions[actions.length - 1];
-  return actions.reduce((state, action) => ({ ...state, ...action }), baseState);
-};
-
-const statesMatch = (state1: GameState | null, state2: GameState | null): boolean => {
-  if (!state1 || !state2) return false;
-  return JSON.stringify(state1) === JSON.stringify(state2);
 };
